@@ -3,6 +3,7 @@
  * Author: Jon Ringle <jringle@gridpoint.com>
  *
  *  Based on max310x.c, by Alexander Shiyan <shc_work@mail.ru>
+ *  Added SPI support for emPC-A/RPI, by Andre Massow <andre.massow@janztec.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,6 +18,7 @@
 #include <linux/device.h>
 #include <linux/gpio.h>
 #include <linux/i2c.h>
+#include <linux/spi/spi.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -26,6 +28,8 @@
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
 #include <linux/uaccess.h>
+
+static bool RS485 = false;
 
 #define SC16IS7XX_NAME			"sc16is7xx"
 
@@ -292,12 +296,16 @@
 
 /* Misc definitions */
 #define SC16IS7XX_FIFO_SIZE		(64)
-#define SC16IS7XX_REG_SHIFT		2
+#define SC16IS7XX_REG_SHIFT_I2C		2
+#define SC16IS7XX_REG_SHIFT_SPI     3
+
 
 struct sc16is7xx_devtype {
 	char	name[10];
 	int	nr_gpio;
 	int	nr_uart;
+	int reg_shift;
+	struct spi_device * spi;
 };
 
 struct sc16is7xx_one {
@@ -312,13 +320,14 @@ struct sc16is7xx_port {
 	struct uart_driver		uart;
 	struct sc16is7xx_devtype	*devtype;
 	struct regmap			*regmap;
-	struct mutex			mutex;
+    struct mutex            mutex;
 	struct clk			*clk;
 #ifdef CONFIG_GPIOLIB
 	struct gpio_chip		gpio;
 #endif
 	unsigned char			buf[SC16IS7XX_FIFO_SIZE];
 	struct sc16is7xx_one		p[0];
+	int 				busy;
 };
 
 #define to_sc16is7xx_one(p,e)	((container_of((p), struct sc16is7xx_one, e)))
@@ -328,8 +337,32 @@ static u8 sc16is7xx_port_read(struct uart_port *port, u8 reg)
 	struct sc16is7xx_port *s = dev_get_drvdata(port->dev);
 	unsigned int val = 0;
 
+#ifdef COMPILE_FOR_I2C
 	regmap_read(s->regmap,
-		    (reg << SC16IS7XX_REG_SHIFT) | port->line, &val);
+		    (reg << s->devtype->reg_shift) | port->line, &val);
+#else
+	{
+	    unsigned char tx[2]={ 0x80 | ((reg<< s->devtype->reg_shift)&0x78) , 0};
+	    unsigned char rx[2]={0, 0};
+	    int ret;
+
+	    struct spi_transfer t = {
+            .tx_buf = &tx,
+            .rx_buf = &rx,
+            .len = 2,
+            .cs_change = 0,
+        };
+        struct spi_message m;
+
+        spi_message_init(&m);
+        spi_message_add_tail(&t, &m);
+
+        ret = spi_async_locked(s->devtype->spi, &m);
+        if (ret)
+            dev_err(&s->devtype->spi->dev, "spi transfer failed: ret = %d\n", ret);
+        val = rx[1];
+	}
+#endif
 
 	return val;
 }
@@ -338,8 +371,32 @@ static void sc16is7xx_port_write(struct uart_port *port, u8 reg, u8 val)
 {
 	struct sc16is7xx_port *s = dev_get_drvdata(port->dev);
 
+#ifdef COMPILE_FOR_I2C
 	regmap_write(s->regmap,
-		     (reg << SC16IS7XX_REG_SHIFT) | port->line, val);
+		     (reg << s->devtype->reg_shift) | port->line, val);
+#else
+    {
+	    unsigned char tx[2]={ ((reg<< s->devtype->reg_shift)&0x78) , val};
+	    unsigned char rx[2]={0, 0};
+	    int ret;
+
+        struct spi_transfer t = {
+            .tx_buf = &tx,
+            .rx_buf = &rx,
+            .len = 2,
+            .cs_change = 0,
+        };
+        struct spi_message m;
+
+        spi_message_init(&m);
+        spi_message_add_tail(&t, &m);
+
+        ret = spi_async_locked(s->devtype->spi, &m);
+        if (ret)
+            dev_err(&s->devtype->spi->dev, "spi transfer failed: ret = %d\n", ret);
+
+    }
+#endif
 }
 
 static void sc16is7xx_port_update(struct uart_port *port, u8 reg,
@@ -347,9 +404,24 @@ static void sc16is7xx_port_update(struct uart_port *port, u8 reg,
 {
 	struct sc16is7xx_port *s = dev_get_drvdata(port->dev);
 
+#ifdef COMPILE_FOR_I2C
 	regmap_update_bits(s->regmap,
-			   (reg << SC16IS7XX_REG_SHIFT) | port->line,
+			   (reg << s->devtype->reg_shift) | port->line,
 			   mask, val);
+#else
+
+	{
+	    u8 tmp;
+	    u8 orig = sc16is7xx_port_read( port, reg );
+
+	    tmp = orig & ~mask;
+	    tmp |= val & mask;
+
+	    sc16is7xx_port_write(port, reg, tmp );
+	}
+
+#endif
+
 }
 
 
@@ -392,7 +464,8 @@ static const struct sc16is7xx_devtype sc16is762_devtype = {
 
 static bool sc16is7xx_regmap_volatile(struct device *dev, unsigned int reg)
 {
-	switch (reg >> SC16IS7XX_REG_SHIFT) {
+    struct sc16is7xx_port *s = dev_get_drvdata(dev);
+	switch (reg >> s->devtype->reg_shift) {
 	case SC16IS7XX_RHR_REG:
 	case SC16IS7XX_IIR_REG:
 	case SC16IS7XX_LSR_REG:
@@ -410,7 +483,8 @@ static bool sc16is7xx_regmap_volatile(struct device *dev, unsigned int reg)
 
 static bool sc16is7xx_regmap_precious(struct device *dev, unsigned int reg)
 {
-	switch (reg >> SC16IS7XX_REG_SHIFT) {
+    struct sc16is7xx_port *s = dev_get_drvdata(dev);
+	switch (reg >> s->devtype->reg_shift) {
 	case SC16IS7XX_RHR_REG:
 		return true;
 	default:
@@ -496,10 +570,45 @@ static void sc16is7xx_handle_rx(struct uart_port *port, unsigned int rxlen,
 			s->buf[0] = sc16is7xx_port_read(port, SC16IS7XX_RHR_REG);
 			bytes_read = 1;
 		} else {
+#ifdef COMPILE_FOR_I2C
 			regcache_cache_bypass(s->regmap, true);
 			regmap_raw_read(s->regmap, SC16IS7XX_RHR_REG,
 					s->buf, rxlen);
 			regcache_cache_bypass(s->regmap, false);
+#else
+		    {
+			    int toread = rxlen;
+			    int sbufoff = 0;
+
+			    while (toread > 0) { // break into chunks of 8 bytes, to prevent CAN overflows
+			        int read = toread>8?8:toread;
+                    unsigned char tx[1+8]={ 0x80 | ((SC16IS7XX_RHR_REG<< s->devtype->reg_shift)&0x78), 0,0,0,0, 0,0,0,0  };
+                    unsigned char rx[1+8]={ 0};
+                    int ret;
+                    int i;
+
+                    struct spi_transfer t = {
+                        .tx_buf = &tx,
+                        .rx_buf = &rx,
+                        .len = 1+read,
+                        .cs_change = 0,
+                    };
+                    struct spi_message m;
+
+                    spi_message_init(&m);
+                    spi_message_add_tail(&t, &m);
+
+                    ret = spi_async_locked(s->devtype->spi, &m);
+                    if (ret)
+                        dev_err(&s->devtype->spi->dev, "spi transfer failed: ret = %d\n", ret);
+
+                    for (i=0;i<read;i++)
+                        s->buf[sbufoff++] = rx[i+1];
+
+                    toread-=read;
+			    }
+		    }
+#endif
 			bytes_read = rxlen;
 		}
 
@@ -579,25 +688,63 @@ static void sc16is7xx_handle_tx(struct uart_port *port)
 			s->buf[i] = xmit->buf[xmit->tail];
 			xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
 		}
+#ifdef COMPILE_FOR_I2C
 		regcache_cache_bypass(s->regmap, true);
 		regmap_raw_write(s->regmap, SC16IS7XX_THR_REG, s->buf, to_send);
 		regcache_cache_bypass(s->regmap, false);
+#else
+        {
+            int towrite = to_send;
+            int sbufoff = 0;
+
+            while (towrite > 0) { // break into chunks of 8 bytes, to prevent CAN overflows
+                int write = towrite>8?8:towrite;
+                unsigned char tx[1+8]={ ((SC16IS7XX_THR_REG<< s->devtype->reg_shift)&0x78), 0 };
+                unsigned char rx[1+8]={0, 0};
+                int ret;
+                int i;
+
+                struct spi_transfer t = {
+                    .tx_buf = &tx,
+                    .rx_buf = &rx,
+                    .len = 1+write,
+                    .cs_change = 0,
+                };
+                struct spi_message m;
+
+                for (i=0;i<write;i++)
+                    tx[i+1] = s->buf[sbufoff++];
+
+                spi_message_init(&m);
+                spi_message_add_tail(&t, &m);
+
+                ret = spi_async_locked(s->devtype->spi, &m);
+                if (ret)
+                    dev_err(&s->devtype->spi->dev, "spi transfer failed: ret = %d\n", ret);
+
+                towrite-=write;
+            }
+        }
+#endif
 	}
 
 	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
 		uart_write_wakeup(port);
 }
 
-static void sc16is7xx_port_irq(struct sc16is7xx_port *s, int portno)
+static irqreturn_t sc16is7xx_port_irq(struct sc16is7xx_port *s, int portno)
 {
 	struct uart_port *port = &s->p[portno].port;
-
+#ifndef COMPILE_FOR_I2C
+	 unsigned long flags;
+#endif
 	do {
 		unsigned int iir, msr, rxlen;
 
 		iir = sc16is7xx_port_read(port, SC16IS7XX_IIR_REG);
 		if (iir & SC16IS7XX_IIR_NO_INT_BIT)
-			break;
+		    break;
+		//	return IRQ_NONE;
 
 		iir &= SC16IS7XX_IIR_ID_MASK;
 
@@ -617,9 +764,14 @@ static void sc16is7xx_port_irq(struct sc16is7xx_port *s, int portno)
 					       !!(msr & SC16IS7XX_MSR_CTS_BIT));
 			break;
 		case SC16IS7XX_IIR_THRI_SRC:
-			mutex_lock(&s->mutex);
-			sc16is7xx_handle_tx(port);
-			mutex_unlock(&s->mutex);
+		    mutex_lock(&s->mutex);
+		    sc16is7xx_handle_tx(port);
+		    mutex_unlock(&s->mutex);
+/*	if (s->mutex.count.counter!=1) {
+                return IRQ_HANDLED;
+            } else
+                sc16is7xx_handle_tx(port);
+*/
 			break;
 		default:
 			dev_err_ratelimited(port->dev,
@@ -628,17 +780,29 @@ static void sc16is7xx_port_irq(struct sc16is7xx_port *s, int portno)
 			break;
 		}
 	} while (1);
+
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t sc16is7xx_hard_ist(int irq, void *dev_id)
+{
+	disable_irq_nosync(irq);
+    return IRQ_WAKE_THREAD;
 }
 
 static irqreturn_t sc16is7xx_ist(int irq, void *dev_id)
 {
 	struct sc16is7xx_port *s = (struct sc16is7xx_port *)dev_id;
 	int i;
+	irqreturn_t ret=IRQ_NONE;
 
-	for (i = 0; i < s->uart.nr; ++i)
-		sc16is7xx_port_irq(s, i);
-
-	return IRQ_HANDLED;
+	for (i = 0; i < s->uart.nr; ++i) {
+		if (sc16is7xx_port_irq(s, i)==IRQ_HANDLED)
+		    ret = IRQ_HANDLED;
+	}
+	enable_irq(irq);
+	return ret;
 }
 
 static void sc16is7xx_wq_proc(struct work_struct *ws)
@@ -712,7 +876,15 @@ static unsigned int sc16is7xx_get_mctrl(struct uart_port *port)
 	/* DCD and DSR are not wired and CTS/RTS is handled automatically
 	 * so just indicate DSR and CAR asserted
 	 */
-	return TIOCM_DSR | TIOCM_CAR;
+    unsigned int mctrl = TIOCM_DSR | TIOCM_CAR;
+    unsigned int msr;
+
+    msr = sc16is7xx_port_read(port, SC16IS7XX_MSR_REG );
+
+    if (msr & 0x10) /*MSR[4] CTS*/
+        mctrl |= TIOCM_CTS;
+
+    return mctrl;
 }
 
 static void sc16is7xx_md_proc(struct work_struct *ws)
@@ -723,13 +895,35 @@ static void sc16is7xx_md_proc(struct work_struct *ws)
 			      SC16IS7XX_MCR_LOOP_BIT,
 			      (one->port.mctrl & TIOCM_LOOP) ?
 				      SC16IS7XX_MCR_LOOP_BIT : 0);
+
+    sc16is7xx_port_update(&one->port, SC16IS7XX_MCR_REG,
+                    SC16IS7XX_MCR_RTS_BIT,
+                  (one->port.mctrl & TIOCM_RTS) ?
+                          SC16IS7XX_MCR_RTS_BIT : 0);
 }
 
 static void sc16is7xx_set_mctrl(struct uart_port *port, unsigned int mctrl)
 {
+#if 0
 	struct sc16is7xx_one *one = to_sc16is7xx_one(port, port);
+	port->mctrl=mctrl;
 
 	schedule_work(&one->md_work);
+#else
+	struct sc16is7xx_one *one = to_sc16is7xx_one(port, port);
+	port->mctrl=mctrl;
+
+    sc16is7xx_port_update(&one->port, SC16IS7XX_MCR_REG,
+                  SC16IS7XX_MCR_LOOP_BIT,
+                  (mctrl & TIOCM_LOOP) ?
+                      SC16IS7XX_MCR_LOOP_BIT : 0);
+
+    sc16is7xx_port_update(&one->port, SC16IS7XX_MCR_REG,
+                    SC16IS7XX_MCR_RTS_BIT,
+                  (mctrl & TIOCM_RTS) ?
+                          SC16IS7XX_MCR_RTS_BIT : 0);
+
+#endif
 }
 
 static void sc16is7xx_break_ctl(struct uart_port *port, int break_state)
@@ -811,6 +1005,12 @@ static void sc16is7xx_set_termios(struct uart_port *port,
 		flow |= SC16IS7XX_EFR_SWFLOW3_BIT;
 	if (termios->c_iflag & IXOFF)
 		flow |= SC16IS7XX_EFR_SWFLOW1_BIT;
+
+    if (RS485) {
+        sc16is7xx_port_update(port, SC16IS7XX_EFCR_REG,
+                              SC16IS7XX_EFCR_AUTO_RS485_BIT,
+                              SC16IS7XX_EFCR_AUTO_RS485_BIT);
+    }
 
 	sc16is7xx_port_write(port, SC16IS7XX_EFR_REG, flow);
 	regcache_cache_bypass(s->regmap, false);
@@ -1057,7 +1257,7 @@ static int sc16is7xx_gpio_direction_output(struct gpio_chip *chip,
 
 static int sc16is7xx_probe(struct device *dev,
 			   struct sc16is7xx_devtype *devtype,
-			   struct regmap *regmap, int irq, unsigned long flags)
+			   struct regmap *regmap, int irq, unsigned long flags  )
 {
 	unsigned long freq, *pfreq = dev_get_platdata(dev);
 	int i, ret;
@@ -1118,6 +1318,7 @@ static int sc16is7xx_probe(struct device *dev,
 	}
 #endif
 
+
 	mutex_init(&s->mutex);
 
 	for (i = 0; i < devtype->nr_uart; ++i) {
@@ -1147,13 +1348,45 @@ static int sc16is7xx_probe(struct device *dev,
 		sc16is7xx_power(&s->p[i].port, 0);
 	}
 
-	/* Setup interrupt */
-	ret = devm_request_threaded_irq(dev, irq, NULL, sc16is7xx_ist,
-					IRQF_ONESHOT | flags, dev_name(dev), s);
-	if (!ret)
-		return 0;
+	if (s->devtype->reg_shift  ==  SC16IS7XX_REG_SHIFT_I2C)
+    {
+        /* Setup interrupt I2C */
+        ret = devm_request_threaded_irq(dev, irq, NULL, sc16is7xx_ist,
+                        IRQF_ONESHOT | flags, dev_name(dev), s);
+        if (!ret)
+            return 0;
+
+    } else
+	if (s->devtype->reg_shift  ==  SC16IS7XX_REG_SHIFT_SPI)
+    {
+        /* Setup interrupt SPI */
+//        ret = request_irq(irq, sc16is7xx_ist,
+//                                IRQF_ONESHOT | IRQF_TRIGGER_LOW, dev_name(dev), s);
+        ret = devm_request_threaded_irq(dev, irq, sc16is7xx_hard_ist, sc16is7xx_ist,
+                                IRQF_ONESHOT | IRQF_TRIGGER_LOW, SC16IS7XX_NAME, s);
+
+        {
+            struct task_struct *p;
+            for (p = &init_task ; (p = next_task(p)) != &init_task ; ) {
+                if (strstr(p->comm, "-sc16is7")>0)
+                {
+                    struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
+                    sched_setscheduler(p, SCHED_RR, &param);
+                    dev_info(dev, "sc16is7xx priority set to SCHED_RR, MAX_RT_PRIO-1\n");
+                    break;
+                }
+            }
+        }
+
+        if (!ret) {
+            return 0;
+        }
+    }
+    dev_err(dev, "failed to acquire irq %d\n", irq);
+
 
 	mutex_destroy(&s->mutex);
+
 
 #ifdef CONFIG_GPIOLIB
 	if (devtype->nr_gpio)
@@ -1187,7 +1420,11 @@ static int sc16is7xx_remove(struct device *dev)
 		sc16is7xx_power(&s->p[i].port, 0);
 	}
 
+#ifdef COMPILE_FOR_I2C
 	mutex_destroy(&s->mutex);
+#else
+
+#endif
 	uart_unregister_driver(&s->uart);
 	if (!IS_ERR(s->clk))
 		clk_disable_unprepare(s->clk);
@@ -1206,7 +1443,8 @@ static const struct of_device_id __maybe_unused sc16is7xx_dt_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, sc16is7xx_dt_ids);
 
-static struct regmap_config regcfg = {
+// I2C
+static struct regmap_config regcfg_i2c = {
 	.reg_bits = 7,
 	.pad_bits = 1,
 	.val_bits = 8,
@@ -1231,10 +1469,11 @@ static int sc16is7xx_i2c_probe(struct i2c_client *i2c,
 		devtype = (struct sc16is7xx_devtype *)id->driver_data;
 		flags = IRQF_TRIGGER_FALLING;
 	}
+	devtype->reg_shift  =   SC16IS7XX_REG_SHIFT_I2C;
 
-	regcfg.max_register = (0xf << SC16IS7XX_REG_SHIFT) |
+	regcfg_i2c.max_register = (0xf << SC16IS7XX_REG_SHIFT_I2C) |
 			      (devtype->nr_uart - 1);
-	regmap = devm_regmap_init_i2c(i2c, &regcfg);
+	regmap = devm_regmap_init_i2c(i2c, &regcfg_i2c);
 
 	return sc16is7xx_probe(&i2c->dev, devtype, regmap, i2c->irq, flags);
 }
@@ -1264,9 +1503,96 @@ static struct i2c_driver sc16is7xx_i2c_uart_driver = {
 	.remove		= sc16is7xx_i2c_remove,
 	.id_table	= sc16is7xx_i2c_id_table,
 };
+
+// SPI
+static struct regmap_config regcfg_spi = {
+    .reg_bits = 8,
+    .val_bits = 8,
+    .read_flag_mask = 0x80,
+    .cache_type = REGCACHE_NONE,
+    .volatile_reg = sc16is7xx_regmap_volatile,
+    .precious_reg = sc16is7xx_regmap_precious,
+};
+
+static int sc16is7xx_spi_probe(struct spi_device *spi)
+{
+    struct sc16is7xx_devtype *devtype;
+    unsigned long flags = 0;
+    struct regmap *regmap;
+    int ret;
+
+    /* Setup SPI bus */
+    spi->bits_per_word  = 8;
+    spi->mode       = spi->mode ? : SPI_MODE_0;
+    spi->max_speed_hz   = spi->max_speed_hz ? : 26000000;
+
+    ret = spi_setup(spi);
+    if (ret)
+        return ret;
+
+    if (spi->dev.of_node) {
+        const struct of_device_id *of_id =
+                of_match_device(sc16is7xx_dt_ids, &spi->dev);
+
+        devtype = (struct sc16is7xx_devtype *)of_id->data;
+    } else {
+        const struct spi_device_id *id_entry = spi_get_device_id(spi);
+        devtype = (struct sc16is7xx_devtype *)id_entry->driver_data;
+        flags = IRQF_ONESHOT | IRQF_TRIGGER_FALLING;
+    }
+    devtype->reg_shift  =   SC16IS7XX_REG_SHIFT_SPI;
+    devtype->spi = spi;
+
+    regcfg_spi.max_register = (0xf << SC16IS7XX_REG_SHIFT_SPI) |
+                  (devtype->nr_uart - 1);
+    regmap = devm_regmap_init_spi( spi, &regcfg_spi);
+
+    return sc16is7xx_probe(&spi->dev, devtype, regmap, spi->irq, flags);
+}
+
+static int sc16is7xx_spi_remove(struct spi_device *spi)
+{
+    return sc16is7xx_remove(&spi->dev);
+}
+
+
+static const struct spi_device_id sc16is7xx_spi_id_table[] = {
+    { "sc16is7xx",  (kernel_ulong_t)&sc16is74x_devtype, },
+    { "sc16is74x",  (kernel_ulong_t)&sc16is74x_devtype, },
+    { "sc16is750",  (kernel_ulong_t)&sc16is750_devtype, },
+    { "sc16is752",  (kernel_ulong_t)&sc16is752_devtype, },
+    { "sc16is760",  (kernel_ulong_t)&sc16is760_devtype, },
+    { "sc16is762",  (kernel_ulong_t)&sc16is762_devtype, },
+    { }
+};
+
+static struct spi_driver sc16is7xx_spi_uart_driver = {
+        .driver = {
+                .name       = SC16IS7XX_NAME,
+                .owner      = THIS_MODULE,
+                .of_match_table = of_match_ptr(sc16is7xx_dt_ids),
+            },
+            .probe      = sc16is7xx_spi_probe,
+            .remove     = sc16is7xx_spi_remove,
+            .id_table   = sc16is7xx_spi_id_table,
+};
+
+#ifdef COMPILE_FOR_I2C
 module_i2c_driver(sc16is7xx_i2c_uart_driver);
 MODULE_ALIAS("i2c:sc16is7xx");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jon Ringle <jringle@gridpoint.com>");
-MODULE_DESCRIPTION("SC16IS7XX serial driver");
+MODULE_DESCRIPTION("SC16IS7XX serial driver for I2C");
+#else
+module_spi_driver(sc16is7xx_spi_uart_driver);
+MODULE_ALIAS("spi:sc16is7xx");
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Jon Ringle <jringle@gridpoint.com>, Andre Massow <andre.massow@janztec.com>");
+MODULE_DESCRIPTION("SC16IS7XX serial driver for SPI (optimized for Janz Tec AG emPC-A/RPI)");
+#endif
+
+module_param(RS485, bool, 0644);
+MODULE_PARM_DESC(RS485, "force RS485 mode (auto RTS)");
+
