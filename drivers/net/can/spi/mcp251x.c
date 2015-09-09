@@ -245,7 +245,7 @@ struct mcp251x_priv {
 	struct spi_device *spi;
 	enum mcp251x_model model;
 
-	struct mutex mcp_lock; /* SPI device lock */
+	spinlock_t mcp_lock; /* SPI device lock */
 
 	u8 *spi_tx_buf;
 	u8 *spi_rx_buf;
@@ -330,7 +330,8 @@ static int mcp251x_spi_trans(struct spi_device *spi, int len)
 
 	spi_message_add_tail(&t, &m);
 
-	ret = spi_sync(spi, &m);
+	ret = spi_async_locked(spi, &m);  // only in combination with patched spi-bcm2835.c
+
 	if (ret)
 		dev_err(&spi->dev, "spi transfer failed: ret = %d\n", ret);
 	return ret;
@@ -693,6 +694,7 @@ static int mcp251x_stop(struct net_device *net)
 {
 	struct mcp251x_priv *priv = netdev_priv(net);
 	struct spi_device *spi = priv->spi;
+	unsigned long lockflags;
 
 	close_candev(net);
 
@@ -701,7 +703,7 @@ static int mcp251x_stop(struct net_device *net)
 	destroy_workqueue(priv->wq);
 	priv->wq = NULL;
 
-	mutex_lock(&priv->mcp_lock);
+	spin_lock_irqsave(&priv->mcp_lock, lockflags);
 
 	/* Disable and clear pending interrupts */
 	mcp251x_write_reg(spi, CANINTE, 0x00);
@@ -716,7 +718,7 @@ static int mcp251x_stop(struct net_device *net)
 
 	priv->can.state = CAN_STATE_STOPPED;
 
-	mutex_unlock(&priv->mcp_lock);
+	spin_unlock_irqrestore(&priv->mcp_lock, lockflags);
 
 	can_led_event(net, CAN_LED_EVENT_STOP);
 
@@ -745,8 +747,9 @@ static void mcp251x_tx_work_handler(struct work_struct *ws)
 	struct spi_device *spi = priv->spi;
 	struct net_device *net = priv->net;
 	struct can_frame *frame;
+	unsigned long lockflags;
 
-	mutex_lock(&priv->mcp_lock);
+	spin_lock_irqsave(&priv->mcp_lock, lockflags);
 	if (priv->tx_skb) {
 		if (priv->can.state == CAN_STATE_BUS_OFF) {
 			mcp251x_clean(net);
@@ -761,7 +764,7 @@ static void mcp251x_tx_work_handler(struct work_struct *ws)
 			priv->tx_skb = NULL;
 		}
 	}
-	mutex_unlock(&priv->mcp_lock);
+	spin_unlock_irqrestore(&priv->mcp_lock, lockflags);
 }
 
 static void mcp251x_restart_work_handler(struct work_struct *ws)
@@ -770,8 +773,9 @@ static void mcp251x_restart_work_handler(struct work_struct *ws)
 						 restart_work);
 	struct spi_device *spi = priv->spi;
 	struct net_device *net = priv->net;
+	unsigned long lockflags;
 
-	mutex_lock(&priv->mcp_lock);
+	spin_lock_irqsave(&priv->mcp_lock, lockflags);
 	if (priv->after_suspend) {
 		mcp251x_hw_reset(spi);
 		mcp251x_setup(net, priv, spi);
@@ -796,7 +800,7 @@ static void mcp251x_restart_work_handler(struct work_struct *ws)
 		netif_wake_queue(net);
 		mcp251x_error_skb(net, CAN_ERR_RESTARTED, 0);
 	}
-	mutex_unlock(&priv->mcp_lock);
+	spin_unlock_irqrestore(&priv->mcp_lock, lockflags);
 }
 
 static irqreturn_t mcp251x_can_ist(int irq, void *dev_id)
@@ -804,8 +808,9 @@ static irqreturn_t mcp251x_can_ist(int irq, void *dev_id)
 	struct mcp251x_priv *priv = dev_id;
 	struct spi_device *spi = priv->spi;
 	struct net_device *net = priv->net;
+	unsigned long lockflags;
 
-	mutex_lock(&priv->mcp_lock);
+	spin_lock_irqsave(&priv->mcp_lock, lockflags);
 	while (!priv->force_quit) {
 		enum can_state new_state;
 		u8 intf, eflag;
@@ -911,8 +916,9 @@ static irqreturn_t mcp251x_can_ist(int irq, void *dev_id)
 			}
 		}
 
-		if (intf == 0)
-			break;
+		if (intf == 0) {
+		    break;
+		}
 
 		if (intf & CANINTF_TX) {
 			net->stats.tx_packets++;
@@ -926,7 +932,7 @@ static irqreturn_t mcp251x_can_ist(int irq, void *dev_id)
 		}
 
 	}
-	mutex_unlock(&priv->mcp_lock);
+	spin_unlock_irqrestore(&priv->mcp_lock, lockflags);
 	return IRQ_HANDLED;
 }
 
@@ -935,6 +941,7 @@ static int mcp251x_open(struct net_device *net)
 	struct mcp251x_priv *priv = netdev_priv(net);
 	struct spi_device *spi = priv->spi;
 	unsigned long flags = IRQF_ONESHOT | IRQF_TRIGGER_FALLING;
+	unsigned long lockflags;
 	int ret;
 
 	ret = open_candev(net);
@@ -943,15 +950,15 @@ static int mcp251x_open(struct net_device *net)
 		return ret;
 	}
 
-	mutex_lock(&priv->mcp_lock);
+	spin_lock_irqsave(&priv->mcp_lock, lockflags);
 	mcp251x_power_enable(priv->transceiver, 1);
 
 	priv->force_quit = 0;
 	priv->tx_skb = NULL;
 	priv->tx_len = 0;
 
-	ret = request_threaded_irq(spi->irq, NULL, mcp251x_can_ist,
-				   flags | IRQF_ONESHOT, DEVICE_NAME, priv);
+    ret = request_irq(spi->irq, mcp251x_can_ist,
+            IRQF_TRIGGER_LOW, DEVICE_NAME, priv);
 	if (ret) {
 		dev_err(&spi->dev, "failed to acquire irq %d\n", spi->irq);
 		mcp251x_power_enable(priv->transceiver, 0);
@@ -984,7 +991,7 @@ static int mcp251x_open(struct net_device *net)
 	netif_wake_queue(net);
 
 open_unlock:
-	mutex_unlock(&priv->mcp_lock);
+	spin_unlock_irqrestore(&priv->mcp_lock, lockflags);
 	return ret;
 }
 
@@ -1097,7 +1104,7 @@ static int mcp251x_can_probe(struct spi_device *spi)
 		goto out_clk;
 
 	priv->spi = spi;
-	mutex_init(&priv->mcp_lock);
+	spin_lock_init(&priv->mcp_lock);
 
 	/* If requested, allocate DMA buffers */
 	if (mcp251x_enable_dma) {
@@ -1253,6 +1260,7 @@ static struct spi_driver mcp251x_can_driver = {
 module_spi_driver(mcp251x_can_driver);
 
 MODULE_AUTHOR("Chris Elston <celston@katalix.com>, "
-	      "Christian Pellegrin <chripell@evolware.org>");
-MODULE_DESCRIPTION("Microchip 251x CAN driver");
+	      "Christian Pellegrin <chripell@evolware.org>, "
+          "Andre Massow <andre.massow@janztec.com>");
+MODULE_DESCRIPTION("Microchip 251x CAN driver (optimized for emPC-A/RPI)");
 MODULE_LICENSE("GPL v2");
