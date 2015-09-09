@@ -1,7 +1,7 @@
 # emPC-A/RPI by Janz Tec AG
 **Low Cost ARM Cortex-A7 Based Embedded Controller**
 
-On our website (https://www.janztec.com/en/empc-a-rpi.html), the binary emPC-A/RPI driver package is available as a download. This Raspbian compatible .deb package includes all drivers, kernel modifications and configuration entries to enable the additional features of the emPC-A/RPI (RTC, CAN, RS232/RS485), and is based on the source code modifications included in this repository. 
+On our [website](https://www.janztec.com/en/empc-a-rpi.html), the binary emPC-A/RPI driver package is available in the download area. This Raspbian compatible .deb package includes all compiled drivers, kernel modifications and configuration entries to enable the additional features of the emPC-A/RPI (RTC, CAN, RS232/RS485), and is based on the source code modifications included in this repository. 
 
 Product page: https://www.janztec.com/en/empc-a-rpi.html
 ![emPC-A/RPI](https://www.janztec.com/uploads/tx_templavoila/emPC-A_RPI_neu_642x480.jpg)
@@ -30,13 +30,11 @@ Product page: https://www.janztec.com/en/empc-a-rpi.html
 * Power Supply  
   * Input 9 … 32 VDC 
 
-
 for more information on how to compile this repository visit https://github.com/raspberrypi/linux/blob/rpi-3.18.y/README
 
 Before compiling this kernel sources, make sure that the following entries are configured as *modules* in "menuconfig":
-(M) Microchip MCP251x SPI CAN controllers 
-(M) BCM2798 SPI controller driver (SPI0)
-(M) User mode SPI driver support 
-(M) SC16IS7xx serial support 
-(M) Dallas/Maxim DS1307/37/38/39/40, ST M41T00, EPSON RX-8025 
-
+* (M) Microchip MCP251x SPI CAN controllers 
+* (M) BCM2798 SPI controller driver (SPI0)
+* (M) User mode SPI driver support 
+* (M) SC16IS7xx serial support 
+* (M) Dallas/Maxim DS1307/37/38/39/40, ST M41T00, EPSON RX-8025 
