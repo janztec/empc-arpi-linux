@@ -72,7 +72,8 @@
 #define BCM2835_SPI_CS_CS_10		0x00000002
 #define BCM2835_SPI_CS_CS_01		0x00000001
 
-#define BCM2835_SPI_POLLING_LIMIT_US	30
+#define NOQUEUE 1
+#define BCM2835_SPI_POLLING_LIMIT_US    30
 #define BCM2835_SPI_TIMEOUT_MS		30000
 #define BCM2835_SPI_MODE_BITS	(SPI_CPOL | SPI_CPHA | SPI_CS_HIGH \
 				| SPI_NO_CS | SPI_3WIRE)
@@ -168,11 +169,16 @@ static int bcm2835_spi_transfer_one_poll(struct spi_master *master,
 					 unsigned long xfer_time_us)
 {
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
+#ifdef NOQUEUE
+	/* set timeout to 10 second of maximum polling */
+	unsigned long timeout = jiffies + 10*HZ;
+#else
 	/* set timeout to 1 second of maximum polling */
 	unsigned long timeout = jiffies + HZ;
-
+#endif
 	/* enable HW block without interrupts */
 	bcm2835_wr(bs, BCM2835_SPI_CS, cs | BCM2835_SPI_CS_TA);
+
 
 	/* loop until finished the transfer */
 	while (bs->rx_len) {
@@ -287,12 +293,17 @@ static int bcm2835_spi_transfer_one(struct spi_master *master,
 		* 9 /* clocks/byte - SPI-HW waits 1 clock after each byte */
 		* 1000000 / spi_used_hz;
 
+#ifdef NOQUEUE
+	return bcm2835_spi_transfer_one_poll(master, spi, tfr,
+	                             cs, xfer_time_us);
+#else
 	/* for short requests run polling*/
 	if (xfer_time_us <= BCM2835_SPI_POLLING_LIMIT_US)
 		return bcm2835_spi_transfer_one_poll(master, spi, tfr,
 						     cs, xfer_time_us);
 
 	return bcm2835_spi_transfer_one_irq(master, spi, tfr, cs);
+#endif
 }
 
 static void bcm2835_spi_handle_err(struct spi_master *master,
@@ -353,6 +364,72 @@ static void bcm2835_spi_set_cs(struct spi_device *spi, bool gpio_level)
 	/* finally set the calculated flags in SPI_CS */
 	bcm2835_wr(bs, BCM2835_SPI_CS, cs);
 }
+
+#ifdef NOQUEUE
+static int bcm2835_spi_transfer(struct spi_device *spi, struct spi_message *msg)
+{
+    struct spi_transfer *xfer;
+    bool keep_cs = false;
+    int ret = 0;
+    int ms = 1;
+
+    gpio_set_value(spi->cs_gpio, !true);
+
+    list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+
+        if (xfer->tx_buf || xfer->rx_buf) {
+            reinit_completion(&spi->master->xfer_completion);
+
+            ret = bcm2835_spi_transfer_one(spi->master, msg->spi, xfer);
+        
+    if (ret < 0) {
+                dev_err(&msg->spi->dev,
+                    "SPI transfer failed: %d\n", ret);
+                goto out;
+            }
+
+        } else {
+            if (xfer->len)
+                dev_err(&msg->spi->dev,
+                    "Bufferless transfer has length %u\n",
+                    xfer->len);
+        }
+
+        if (msg->status != -EINPROGRESS)
+            goto out;
+
+        if (xfer->delay_usecs)
+            udelay(xfer->delay_usecs);
+
+        if (xfer->cs_change) {
+            if (list_is_last(&xfer->transfer_list,
+                     &msg->transfers)) {
+                keep_cs = true;
+            } else {
+                gpio_set_value(spi->cs_gpio, !false);
+                udelay(10);
+                gpio_set_value(spi->cs_gpio, !true);
+            }
+        }
+
+        msg->actual_length += xfer->len;
+    }
+
+out:
+    if (!keep_cs)
+        gpio_set_value(spi->cs_gpio, !false);
+
+    if (msg->status == -EINPROGRESS)
+        msg->status = ret;
+
+    msg->state = NULL;
+    if (msg->complete)
+        msg->complete(msg->context);
+
+    return ret;
+}
+#endif
+
 
 static int chip_match_name(struct gpio_chip *chip, void *data)
 {
@@ -431,9 +508,15 @@ static int bcm2835_spi_probe(struct platform_device *pdev)
 	master->num_chipselect = 3;
 	master->setup = bcm2835_spi_setup;
 	master->set_cs = bcm2835_spi_set_cs;
+#ifdef NOQUEUE
+	master->transfer = bcm2835_spi_transfer;
+	dev_info(&pdev->dev, "unqueued spi\n");
+#else
 	master->transfer_one = bcm2835_spi_transfer_one;
+#endif
 	//master->handle_err = bcm2835_spi_handle_err;
 	master->dev.of_node = pdev->dev.of_node;
+	master->rt = 1; // ama 2015-06
 
 	bs = spi_master_get_devdata(master);
 
@@ -517,6 +600,6 @@ static struct platform_driver bcm2835_spi_driver = {
 };
 module_platform_driver(bcm2835_spi_driver);
 
-MODULE_DESCRIPTION("SPI controller driver for Broadcom BCM2835");
-MODULE_AUTHOR("Chris Boot <bootc@bootc.net>");
+MODULE_DESCRIPTION("SPI controller driver for Broadcom BCM2835 (optmized for Janz Tec AG emPC-A/RPI)");
+MODULE_AUTHOR("Chris Boot <bootc@bootc.net>, Andre Massow <andre.massow@janztec.com>");
 MODULE_LICENSE("GPL v2");
