@@ -14,7 +14,7 @@ Product page: https://www.janztec.com/en/empc-a-rpi.html
   * Fanless cooling concept 
   * Realtime clock, battery buffered 
 * Memory 
-  * System memory 1 GB SDRAM 
+  * System memory 1 GB 
   * External accessible µSD card slot  
 * Graphics 
   * HDMI graphic interface  
@@ -33,4 +33,10 @@ Product page: https://www.janztec.com/en/empc-a-rpi.html
 
 for more information on how to compile this repository visit https://github.com/raspberrypi/linux/blob/rpi-3.18.y/README
 
+Before compiling this kernel sources, make sure that the following entries are configured as *modules* in "menuconfig":
+(M) Microchip MCP251x SPI CAN controllers 
+(M) BCM2798 SPI controller driver (SPI0)
+(M) User mode SPI driver support 
+(M) SC16IS7xx serial support 
+(M) Dallas/Maxim DS1307/37/38/39/40, ST M41T00, EPSON RX-8025 
 
