@@ -69,13 +69,6 @@
 #include <linux/broadcom/vc_cma.h>
 #endif
 
-
-#include <linux/can/platform/mcp251x.h>
-#include <linux/gpio.h>
-#include <linux/irq.h>
-#define MCP2515_CAN_INT_GPIO_PIN 25
-#define SC16IS740_UART_INT_GPIO_PIN 17
-
 //#define SYSTEM_TIMER
 
 /* Effectively we have an IOMMU (ARM<->VideoCore map) that is set up to
@@ -587,31 +580,23 @@ static struct platform_device bcm2708_spi_device = {
 		.coherent_dma_mask = DMA_BIT_MASK(DMA_MASK_BITS_COMMON)},
 };
 
-static struct mcp251x_platform_data mcp251x_info = {
-  .oscillator_frequency = 16000000
-};
-static unsigned long sc16is7xx_platform_data = 1843200;
-
-
 #ifdef CONFIG_BCM2708_SPIDEV
 static struct spi_board_info bcm2708_spi_devices[] = {
-
+#ifdef CONFIG_SPI_SPIDEV
 	{
-	    .modalias = "mcp2515",
-	    .max_speed_hz = 10000000,
-	    .platform_data = &mcp251x_info,
+		.modalias = "spidev",
+		.max_speed_hz = 500000,
 		.bus_num = 0,
 		.chip_select = 0,
 		.mode = SPI_MODE_0,
 	}, {
-	    .modalias = "sc16is7xx",
-	    .max_speed_hz = 5000000,
-	    .platform_data = &sc16is7xx_platform_data, /* UART clock */
+		.modalias = "spidev",
+		.max_speed_hz = 500000,
 		.bus_num = 0,
 		.chip_select = 1,
 		.mode = SPI_MODE_0,
 	}
-
+#endif
 };
 #endif
 
@@ -916,7 +901,7 @@ void __init bcm2709_init(void)
 	bcm_register_device(&bcm2708_powerman_device);
 
 #ifdef CONFIG_MMC_BCM2835
-	bcm_register_device(&bcm2835_emmc_device);
+	bcm_register_device_dt(&bcm2835_emmc_device);
 #endif
 	bcm2709_init_led();
 	for (i = 0; i < ARRAY_SIZE(bcm2708_alsa_devices); i++)
@@ -979,12 +964,9 @@ void __init bcm2709_init(void)
 	system_serial_low = serial;
 
 #ifdef CONFIG_BCM2708_SPIDEV
-	if (!use_dt) {
-	    bcm2708_spi_devices[0].irq = 128+128+ MCP2515_CAN_INT_GPIO_PIN;
-	    bcm2708_spi_devices[1].irq = 128+128+ SC16IS740_UART_INT_GPIO_PIN;
+	if (!use_dt)
 	    spi_register_board_info(bcm2708_spi_devices,
 				    ARRAY_SIZE(bcm2708_spi_devices));
-	}
 #endif
 }
 
@@ -1153,7 +1135,10 @@ void __init bcm2709_init_early(void)
 	 */
 	init_dma_coherent_pool_size(SZ_4M);
 
-	use_dt = 0;
+#ifdef CONFIG_OF
+	if (of_allnodes)
+	    use_dt = 1;
+#endif
 }
 
 static void __init board_reserve(void)
