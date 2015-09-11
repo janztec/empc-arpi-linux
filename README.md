@@ -32,9 +32,6 @@ Product page: https://www.janztec.com/en/empc-a-rpi.html
 
 for more information on how to compile this repository visit https://github.com/raspberrypi/linux/blob/rpi-3.18.y/README
 
-Before compiling this kernel sources, make sure that the following entries are configured as *modules* in "menuconfig":
-* (M) Microchip MCP251x SPI CAN controllers 
-* (M) BCM2798 SPI controller driver (SPI0)
-* (M) User mode SPI driver support 
+Before compiling this kernel sources, make sure that "bcm2709_defconfig" configuration is loaded and the following entries are configured as *modules* in "menuconfig":
 * (M) SC16IS7xx serial support 
-* (M) Dallas/Maxim DS1307/37/38/39/40, ST M41T00, EPSON RX-8025 
+
