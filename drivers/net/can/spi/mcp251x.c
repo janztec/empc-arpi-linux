@@ -950,6 +950,11 @@ static int mcp251x_open(struct net_device *net)
 		return ret;
 	}
 
+	// moved before spinlock to prevent "BUG: scheduling while atomic" 
+	priv->wq = create_freezable_workqueue("mcp251x_wq");
+	INIT_WORK(&priv->tx_work, mcp251x_tx_work_handler);
+	INIT_WORK(&priv->restart_work, mcp251x_restart_work_handler);
+	
 	spin_lock_irqsave(&priv->mcp_lock, lockflags);
 	mcp251x_power_enable(priv->transceiver, 1);
 
@@ -965,10 +970,6 @@ static int mcp251x_open(struct net_device *net)
 		close_candev(net);
 		goto open_unlock;
 	}
-
-	priv->wq = create_freezable_workqueue("mcp251x_wq");
-	INIT_WORK(&priv->tx_work, mcp251x_tx_work_handler);
-	INIT_WORK(&priv->restart_work, mcp251x_restart_work_handler);
 
 	ret = mcp251x_hw_reset(spi);
 	if (ret) {
