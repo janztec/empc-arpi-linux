@@ -1,10 +1,10 @@
 # emPC-A/RPI by Janz Tec AG
 **Low Cost ARM Cortex-A7 Based Embedded Controller**
 
-On our [website](https://www.janztec.com/en/empc-a-rpi.html), the binary emPC-A/RPI driver package is available in the download area. This Raspbian compatible .deb package includes all compiled drivers, kernel modifications and configuration entries to enable the additional features of the emPC-A/RPI (RTC, CAN, RS232/RS485), and is based on the source code modifications included in this repository. 
+Visit https://github.com/janztec/empc-arpi-linux-drivers/blob/master/README.md#installation-instructions for instruction on how to automatically install drivers and configuration entries to enable the additional features of the emPC-A/RPI (RTC, CAN, RS232/RS485).
 
 Product page: https://www.janztec.com/en/empc-a-rpi.html
-![emPC-A/RPI](https://www.janztec.com/uploads/tx_templavoila/emPC-A_RPI_neu_642x480.jpg)
+![emPC-A/RPI](https://www.janztec.com/fileadmin/_processed_/csm_janztec_produkte_embedded_empc_a-pri_1_57fdb80040.jpg)
 
 **FEATURES emPC-A/RPI**
 * Processor 
