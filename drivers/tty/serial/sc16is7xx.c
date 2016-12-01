@@ -1128,6 +1128,15 @@ static int sc16is7xx_startup(struct uart_port *port)
 	      SC16IS7XX_IER_CTSI_BIT;
 	sc16is7xx_port_write(port, SC16IS7XX_IER_REG, val);
 
+	/* ama 2016-12: fixed error message "unexpected interrupt: 8" in dmesg by added mdelay(1)
+	 * without delay, after enabling the interrupts in IER, set_baud/set_termios is immediatly called, 
+	 * enables enhanced register ("config mode") with LCR = 0xBF and the first interrupt occurs at
+	 * the same time, resulting in reading the IIR interrupt status register in the wrong mode.  
+	 * This problematic time window, from enabling the interrupts to handling them, is about 100µs, so a
+	 * delay of 1000µs=1ms was choosen
+	 */
+	mdelay(1); 
+	
 	return 0;
 }
 
